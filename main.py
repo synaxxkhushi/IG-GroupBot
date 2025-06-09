@@ -1,7 +1,9 @@
-import asyncio, os, random
+import asyncio
+import os
+import random
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 load_dotenv()
 USERNAME = os.getenv("IG_USER")
@@ -11,25 +13,35 @@ WELCOME_TEXT = "🎉 Welcome {name}!"
 PING_TEXT = "Hey {mentions}, koi online aaye? 😄"
 INACTIVE_HOURS = 3
 PING_COUNT = 4
+MAX_LOGIN_RETRIES = 3
 
 async def send_message(page, text):
     try:
         box = await page.query_selector('textarea')
         if box:
+            await box.fill("")  # clear existing text
             await box.type(text)
             await box.press("Enter")
+            print(f"✉️ Sent message: {text[:30]}...")
+        else:
+            print("❌ Textarea not found for sending message")
     except Exception as e:
         print(f"❌ Error sending message: {e}")
 
 async def get_all_group_threads(page):
     await page.goto("https://www.instagram.com/direct/inbox/")
-    await page.wait_for_selector("div[role='dialog'] a[href*='/direct/t/']", timeout=15000)
+    try:
+        await page.wait_for_selector("div[role='dialog'] a[href*='/direct/t/']", timeout=15000)
+    except PlaywrightTimeoutError:
+        print("❌ Timeout waiting for group threads")
+        return {}
+
     links = await page.query_selector_all("div[role='dialog'] a[href*='/direct/t/']")
     group_threads = {}
     for l in links:
         title = (await l.inner_text()).strip()
         href = await l.get_attribute("href")
-        if "/direct/t/" in href:
+        if href and "/direct/t/" in href:
             thread_id = href.split("/")[-2]
             group_threads[thread_id] = {
                 "title": title,
@@ -49,6 +61,7 @@ async def fetch_participants(page):
             for u in user_imgs:
                 alt = await u.get_attribute("alt")
                 if alt and USERNAME not in alt:
+                    # Format: "Username's profile picture"
                     name = alt.split("'s")[0].strip()
                     if name:
                         names.append(name)
@@ -61,10 +74,14 @@ async def fetch_participants(page):
 async def handle_group(page, thread_id, state):
     group_url = f"https://www.instagram.com/direct/t/{thread_id}/"
     await page.goto(group_url)
-    await page.wait_for_selector('textarea', timeout=15000)
+    try:
+        await page.wait_for_selector('textarea', timeout=15000)
+    except PlaywrightTimeoutError:
+        print(f"❌ Timeout waiting for textarea in group {state['title']}")
+        return
 
-    participants = await fetch_participants(page)
-    state["participants"] = participants
+    # Initialize participants
+    state["participants"] = await fetch_participants(page)
 
     async def on_response(resp):
         if "/direct-v2/threads/" not in resp.url:
@@ -77,8 +94,6 @@ async def handle_group(page, thread_id, state):
             txt = item.get("text", "")
             ts = item.get("timestamp")
             if ts:
-                # Instagram timestamps are usually in microseconds, adjust accordingly
-                # But sometimes it's milliseconds, try both
                 try:
                     state["last_activity"] = datetime.fromtimestamp(int(ts) / 1e6, timezone.utc)
                 except:
@@ -100,7 +115,7 @@ async def handle_group(page, thread_id, state):
         now = datetime.now(timezone.utc)
         if now - state["last_activity"] > timedelta(hours=INACTIVE_HOURS):
             active_users = [u for u in state["participants"] if u != USERNAME]
-            if len(active_users) >= 1:
+            if active_users:
                 ping_list = random.sample(active_users, min(PING_COUNT, len(active_users)))
                 mentions = " ".join([f"@{u}" for u in ping_list])
                 await send_message(page, PING_TEXT.format(mentions=mentions))
@@ -108,24 +123,35 @@ async def handle_group(page, thread_id, state):
         await asyncio.sleep(60)
 
 async def login(page):
-    try:
-        await page.goto("https://www.instagram.com/accounts/login/")
-        await page.wait_for_selector('input[name="username"]', timeout=60000)
-        await page.fill('input[name="username"]', USERNAME)
-        await page.fill('input[name="password"]', PASSWORD)
-        await page.click("button[type='submit']")
-        await page.wait_for_selector("nav", timeout=15000)
-        print("✅ Login successful!")
-        return True
-    except Exception as e:
-        print(f"❌ Login failed: {e}")
-        content = await page.content()
-        print("Page content at failure:\n", content[:1000])  # print first 1000 chars
-        return False
+    for attempt in range(1, MAX_LOGIN_RETRIES + 1):
+        try:
+            await page.goto("https://www.instagram.com/accounts/login/")
+            await page.wait_for_selector('input[name="username"]', timeout=60000)
+            await page.fill('input[name="username"]', USERNAME)
+            await page.fill('input[name="password"]', PASSWORD)
+            await page.click("button[type='submit']")
+            await page.wait_for_selector("nav", timeout=15000)
+            print("✅ Login successful!")
+            return True
+        except Exception as e:
+            print(f"❌ Login attempt {attempt} failed: {e}")
+            if attempt == MAX_LOGIN_RETRIES:
+                content = await page.content()
+                print("Page content at failure:\n", content[:1000])
+                return False
+            await asyncio.sleep(5)
+    return False
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)  # debug mode
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+            ],
+        )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800},
@@ -135,6 +161,7 @@ async def main():
 
         success = await login(page)
         if not success:
+            print("❌ Could not login. Exiting...")
             return
 
         group_threads = await get_all_group_threads(page)
@@ -152,4 +179,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
