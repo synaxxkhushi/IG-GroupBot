@@ -31,4 +31,6 @@ Automatically welcomes new users in Instagram groups, tracks activity & pings on
    ```bash
    git clone https://github.com/otterai/IG-GroupBot.git
    cd IG-GroupBot
+   pip install -r requirements.txt
+   python3 main.py
    
